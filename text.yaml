@@ -1,0 +1,215 @@
+layer-cos.yaml
+```
+name: cos
+type: juju_kubernetes_workload
+parent: existing_juju_maas_controller_k8s
+features: []
+config:
+  bundle_options:
+    series: jammy
+  offers:
+  - application: alertmanager
+    endpoints:
+    - karma-dashboard
+  - application: prometheus
+    endpoints:
+    - metrics-endpoint
+    - receive-remote-write
+  - application: grafana
+    endpoints:
+    - grafana-dashboard
+  - application: loki
+    endpoints:
+    - logging
+  - application: scrape-interval-config-metrics
+    endpoints:
+    - configurable-scrape-jobs
+  - application: scrape-interval-config-monitors
+    endpoints:
+    - configurable-scrape-jobs
+  juju_model: cos
+  build_bundle: false
+  #model_config: {}
+  trust_bundle: true
+  retry_error_count: 5
+  bundles:
+  - ../common/bundle-cos.yaml
+  - ../common/overlay-cos-storage.yaml
+  - ../common/overlay-cos-offers.yaml
+  # - ../common/overlay-cos-certificates.yaml
+  wait_exclude:
+  - scrape-interval-config-metrics
+  - scrape-intedrval-config-monitors
+```
+
+
+bundle-cos.yaml
+```
+bundle: kubernetes
+applications:
+  loki:
+    charm: loki-k8s
+    channel: 3.7/stable
+    base: ubuntu@26.04
+    scale: 1
+    trust: true
+    options:
+      reporting-enabled: false
+
+  scrape-interval-config-metrics:
+    charm: prometheus-scrape-config-k8s
+    channel: 2/stable
+    scale: 1
+    options:
+      scrape_timeout: 15s
+      scrape_interval: 15s
+  scrape-interval-config-monitors:
+    charm: prometheus-scrape-config-k8s
+    channel: 2/stable
+    scale: 1
+    options:
+      scrape_timeout: 30s
+      scrape_interval: 5m
+
+
+
+  alertmanager:
+    charm: alertmanager-k8s
+    channel: 0.31/stable
+    base: ubuntu@26.04
+    scale: 1
+    trust: true
+  catalogue:
+    charm: catalogue-k8s
+    channel: 3.0/stable
+    base: ubuntu@26.04
+    scale: 1
+  prometheus:
+    charm: prometheus-k8s
+    channel: 3.11/stable
+    base: ubuntu@26.04
+    scale: 
+    trust: true
+
+
+
+  grafana:
+    charm: grafana-k8s
+    channel: 12.4/stable
+    base: ubuntu@26.04
+    scale: 1
+    trust: true
+  traefik:
+    charm: traefik-k8s
+    channel: latest/stable
+    base: ubuntu@26.04
+    scale: 1
+    trust: true
+
+relations:
+- [ alertmanager:alerting, loki:alertmanager ]
+- [ alertmanager:alerting, prometheus:alertmanager ]
+- [ alertmanager:grafana-dashboard, grafana:grafana-dashboard ]
+
+
+- [ alertmanager:grafana-source, grafana:grafana-source ]
+- [ alertmanager:self-metrics-endpoint, prometheus:metrics-endpoint ]
+
+
+
+
+
+- [ catalogue:catalogue, alertmanager:catalogue ]
+- [ catalogue:catalogue, grafana:catalogue ]
+- [ catalogue:catalogue, prometheus:catalogue ]
+
+
+
+- [ grafana:metrics-endpoint, prometheus:metrics-endpoint ]
+- [ loki:grafana-dashboard, grafana:grafana-dashboard ]
+- [ loki:grafana-source, grafana:grafana-source ]
+- [ loki:metrics-endpoint, prometheus:metrics-endpoint ]
+- [ prometheus:grafana-dashboard, grafana:grafana-dashboard ]
+- [ prometheus:grafana-source, grafana:grafana-source ]
+- [ scrape-interval-config-metrics:metrics-endpoint, prometheus:metrics-endpoint ]
+- [ scrape-interval-config-monitors:metrics-endpoint, prometheus:metrics-endpoint ]
+- [ traefik:ingress, alertmanager:ingress ]
+- [ traefik:ingress, catalogue:ingress ]
+- [ traefik:ingress, grafana:ingress ]
+- [ traefik:ingress-per-unit, loki:ingress ]
+- [ traefik:ingress-per-unit, prometheus:ingress ]
+- [ traefik:metrics-endpoint, prometheus:metrics-endpoint ]
+```
+
+overlay-cos-offers.yaml
+
+```
+applications:
+  alertmanager:
+    offers:
+      alertmanager:
+        endpoints:
+        - karma-dashboard
+  prometheus:
+    offers:
+      prometheus:
+        endpoints:
+        - metrics-endpoint
+        - receive-remote-write
+  grafana:
+    offers:
+      grafana:
+        endpoints:
+        - grafana-dashboard
+  loki:
+    offers:
+      loki:
+        endpoints:
+        - logging
+  scrape-interval-config-metrics:
+    offers:
+      scrape-interval-config-metrics:
+        endpoints:
+        - configurable-scrape-jobs
+  scrape-interval-config-monitors:
+    offers:
+      scrape-interval-config-monitors:
+        endpoints:
+        - configurable-scrape-jobs
+```
+
+
+overlay-cos-storage.yaml
+```
+applications:
+  alertmanager:
+    storage:
+      # The Alertmanager operator uses the `database` storage to
+      # store nflog and silence snapshots.
+      # See the `--storage.path` argument of Alertmanager
+      data: 10G
+  grafana:
+    storage:
+      # The Grafana operator uses the `database` storage to store
+      # configurations, plugins, user data, etc. That is, everything
+      # that is normally stored under /var/lib/grafana.
+      database: 10G
+  loki:
+    storage:
+      # This is the volume used by loki for the index of boltdb-shipper.
+      # See https://grafana.com/docs/loki/latest/configuration/examples/
+      active-index-directory: 10G
+      # Loki will store in this volume the chunks, which contain the
+      # actual log content.
+      # See https://grafana.com/docs/loki/latest/operations/storage/
+      # The storage must be pretty large, as this is for storing all the logs for as long as required (eg. 1 month).
+      # TODO: link to COS and/or Bootstack team recommendation
+      loki-chunks: 10G
+  prometheus:
+    storage:
+      # Prometheus operator uses the `database` storage to store TSDB data.
+      # See the `--storage.tsdb.path` argument of Prometheus.
+      # This storage must be large, as this is for storing metrics for as long as required (eg. 1 month).
+      # TODO: link to COS and/or Bootstack team recommendation
+      database: 10G
+```
