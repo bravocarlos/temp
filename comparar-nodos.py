@@ -78,6 +78,19 @@ def enriquecer_nics(entradas, ifaces, comparar_ips=False):
         if cruda is None:
             continue
 
+        # La MAC no va al bucketsconfig, pero decide contra que interfaz
+        # resuelve MAAS el DHCP del arranque. Un bond que hereda la MAC de
+        # la NIC de PXE rompe el boot sin que se note en la config.
+        mac = cruda.get("mac_address")
+        if mac:
+            e["_mac"] = mac.lower()
+
+        # comparar_entrada() ordena las listas, asi que el orden real de los
+        # miembros del bond queda oculto. De ese orden sale la MAC heredada.
+        if cruda.get("type") in ("bond", "bridge"):
+            # string, no lista: asi normalizar() no lo ordena y el orden cuenta
+            e["_orden_miembros"] = " ".join(cruda.get("parents") or [])
+
         links = cruda.get("links") or []
         if not links:
             e["_estado"] = "sin-configurar"
@@ -129,8 +142,22 @@ def leer_nodo(args, system_id, jsons, snapshot=None):
     datos = {
         "disks": gen.construir_discos(disks, boot, gen.indice_discos(hw), avisos),
         "nics": nics,
+        "maquina": datos_maquina(machine),
     }
     return hostname, datos, avisos
+
+
+def datos_maquina(machine):
+    """Campos del nodo que no son ni disco ni interfaz pero deciden el boot."""
+    bi = machine.get("boot_interface") or {}
+    e = {"id": "boot_interface",
+         "nombre": bi.get("name", "<ninguna>"),
+         "tipo": bi.get("type", "?")}
+    if bi.get("mac_address"):
+        e["mac"] = bi["mac_address"].lower()
+
+    bd = machine.get("boot_disk") or {}
+    return [e, {"id": "boot_disk", "nombre": bd.get("name", "<ninguno>")}]
 
 
 # --------------------------------------------------------------- comparacion
@@ -248,6 +275,8 @@ def main():
     print()
 
     total = 0
+    total += comparar_seccion("NODO", datos_a["maquina"], datos_b["maquina"],
+                              eti_a, eti_b)
     total += comparar_seccion("DISCOS", datos_a["disks"], datos_b["disks"],
                               eti_a, eti_b)
     total += comparar_seccion("RED", datos_a["nics"], datos_b["nics"],
