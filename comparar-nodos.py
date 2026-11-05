@@ -1,138 +1,130 @@
 #!/usr/bin/env python3
 """
-diff-crudo.py
+resumen-netplan.py
 
-Diffea el JSON COMPLETO que devuelve la API de MAAS para dos nodos, sin
-filtrar campos. A diferencia de comparar-nodos.py, que solo mira lo que
-entra en el bucketsconfig, esto compara todo: enabled, tags, children,
-vlan.dhcp_on, numa_node, sriov, lo que sea.
-
-Si comparar-nodos.py dice IDENTICOS y el comportamiento es distinto,
-la diferencia esta en algun campo que este script SI va a mostrar.
-
-Solo quita claves volatiles (ids internos, URIs, timestamps) porque
-cambian en cada creacion y tapan todo lo demas.
+Resume un netplan o un curtin config a una linea por interfaz, en orden
+estable, para poder diffear dos nodos sin leer 2000 lineas de YAML.
 
 Uso:
-    ./diff-crudo.py --a-snapshot /srv/snap-oscan01-a-mano --b 4k6ta3
-    ./diff-crudo.py --a 4k6ta3 --b 8mfpam --ignorar-macs
-    ./diff-crudo.py --a-snapshot DIR --b ID --que machine
+    ./resumen-netplan.py /tmp/curtin-ok.yaml
+    diff -u <(./resumen-netplan.py /tmp/curtin-ok.yaml) \\
+            <(./resumen-netplan.py /tmp/curtin-fce.yaml)
+
+Acepta:
+  - netplan puro (/etc/netplan/50-cloud-init.yaml)
+  - curtin config con network: v2 anidado
+  - curtin config v1 (network: {config: [...]})
 """
 
-import argparse
-import difflib
-import json
-import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 try:
-    import maas2bucketsconfig as gen
+    import yaml
 except ImportError:
-    sys.exit("Falta maas2bucketsconfig.py en el mismo directorio.")
+    sys.exit("Falta PyYAML:  sudo apt install -y python3-yaml")
+
+SECCIONES = ("ethernets", "bonds", "vlans", "bridges")
 
 
-# Claves que cambian en cada creacion y no dicen nada sobre la config.
-VOLATILES = {
-    "id", "resource_uri", "href", "system_id", "created", "updated",
-    "node_id", "interface_id", "link_id", "uuid", "path",
-    "discovered", "firmware_version", "product", "serial", "model",
-}
+def sacar_v2(doc):
+    """Encuentra el bloque netplan v2 este donde este."""
+    if not isinstance(doc, dict):
+        return None
+    if any(s in doc for s in SECCIONES):
+        return doc
+    net = doc.get("network")
+    if isinstance(net, dict):
+        if any(s in net for s in SECCIONES):
+            return net
+        return sacar_v2(net)
+    # curtin a veces mete el netplan dentro de write_files / debconf
+    for v in doc.values():
+        hallado = sacar_v2(v) if isinstance(v, dict) else None
+        if hallado:
+            return hallado
+    return None
 
 
-def limpiar(obj, ignorar_macs=False):
-    """Saca claves volatiles de forma recursiva."""
-    if isinstance(obj, dict):
-        salida = {}
-        for k, v in obj.items():
-            if k in VOLATILES:
-                continue
-            if ignorar_macs and k in ("mac_address", "mac_addresses",
-                                      "parent_mac", "boot_interface_mac"):
-                continue
-            salida[k] = limpiar(v, ignorar_macs)
-        return salida
-    if isinstance(obj, list):
-        return [limpiar(v, ignorar_macs) for v in obj]
-    return obj
+def resumir_rutas(cfg):
+    partes = []
+    for r in cfg.get("routes") or []:
+        tabla = r.get("table", "main")
+        partes.append("%s>%s@t%s" % (r.get("to", "?"), r.get("via", "?"), tabla))
+    return partes
 
 
-def ordenar(obj):
-    """Ordena listas de interfaces/discos por nombre para que el diff alinee."""
-    if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-        clave = None
-        for c in ("name", "id_path", "model"):
-            if c in obj[0]:
-                clave = c
-                break
-        if clave:
-            return sorted((ordenar(o) for o in obj),
-                          key=lambda d: str(d.get(clave, "")))
-        return [ordenar(o) for o in obj]
-    if isinstance(obj, dict):
-        return {k: ordenar(v) for k, v in obj.items()}
-    return obj
+def resumir_politica(cfg):
+    partes = []
+    for p in cfg.get("routing-policy") or []:
+        partes.append("from=%s>t%s" % (p.get("from", "?"), p.get("table", "?")))
+    return partes
 
 
-def leer(args, system_id, snapshot, que):
-    if snapshot:
-        ifaces, disks, machine = gen.cargar_snapshot(snapshot)
-    else:
-        ifaces = gen.run_maas(args.profile, "interfaces", "read", system_id)
-        disks = gen.run_maas(args.profile, "block-devices", "read", system_id)
-        machine = gen.run_maas(args.profile, "machine", "read", system_id)
-    return {"interfaces": ifaces, "disks": disks, "machine": machine}[que]
+def linea(seccion, nombre, cfg):
+    campos = ["%-8s" % seccion, "%-16s" % nombre]
 
+    campos.append("mtu=%s" % cfg.get("mtu", "-"))
 
-def texto(obj, ignorar_macs):
-    obj = ordenar(limpiar(obj, ignorar_macs))
-    return json.dumps(obj, indent=2, sort_keys=True,
-                      ensure_ascii=False).splitlines(keepends=True)
+    if cfg.get("dhcp4"):
+        campos.append("dhcp4=true")
+
+    dirs = cfg.get("addresses") or []
+    campos.append("ip=%s" % (",".join(str(d) for d in dirs) if dirs else "-"))
+
+    gw = cfg.get("gateway4") or cfg.get("gateway6")
+    campos.append("GW=%s" % (gw if gw else "-"))
+
+    rutas = resumir_rutas(cfg)
+    campos.append("rutas=%s" % (";".join(rutas) if rutas else "-"))
+
+    pol = resumir_politica(cfg)
+    campos.append("politica=%s" % (";".join(pol) if pol else "-"))
+
+    if cfg.get("optional"):
+        campos.append("optional=true")
+
+    for k in ("link", "id", "interfaces"):
+        if k in cfg:
+            v = cfg[k]
+            campos.append("%s=%s" % (k, ",".join(v) if isinstance(v, list) else v))
+
+    ns = (cfg.get("nameservers") or {}).get("addresses")
+    if ns:
+        campos.append("dns=%s" % ",".join(ns))
+
+    return "  ".join(campos)
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Diff del JSON crudo de MAAS entre dos nodos")
-    ap.add_argument("--profile", default="root")
-    ap.add_argument("--a")
-    ap.add_argument("--b")
-    ap.add_argument("--a-snapshot", metavar="DIR")
-    ap.add_argument("--b-snapshot", metavar="DIR")
-    ap.add_argument("--etiqueta-a", default="A")
-    ap.add_argument("--etiqueta-b", default="B")
-    ap.add_argument("--que", default="interfaces",
-                    choices=["interfaces", "disks", "machine"],
-                    help="que objeto comparar (default: interfaces)")
-    ap.add_argument("--ignorar-macs", action="store_true",
-                    help="util comparando nodos DISTINTOS, donde las MAC "
-                         "difieren siempre")
-    ap.add_argument("--contexto", type=int, default=3)
-    args = ap.parse_args()
+    if len(sys.argv) != 2:
+        sys.exit(__doc__)
 
-    if not (args.a or args.a_snapshot) or not (args.b or args.b_snapshot):
-        ap.error("hace falta una fuente por lado")
+    with open(sys.argv[1]) as fh:
+        docs = [d for d in yaml.safe_load_all(fh) if d]
 
-    a = leer(args, args.a, args.a_snapshot, args.que)
-    b = leer(args, args.b, args.b_snapshot, args.que)
+    v2 = None
+    for d in docs:
+        v2 = sacar_v2(d)
+        if v2:
+            break
 
-    ta = texto(a, args.ignorar_macs)
-    tb = texto(b, args.ignorar_macs)
+    if not v2:
+        sys.exit("No encontre un bloque netplan v2 en %s" % sys.argv[1])
 
-    d = list(difflib.unified_diff(ta, tb,
-                                  fromfile="%s (%s)" % (args.etiqueta_a, args.que),
-                                  tofile="%s (%s)" % (args.etiqueta_b, args.que),
-                                  n=args.contexto))
-    if not d:
-        print("Sin diferencias en '%s' (quitando ids/URIs/timestamps)."
-              % args.que)
-        return 0
+    salida = []
+    for seccion in SECCIONES:
+        for nombre, cfg in sorted((v2.get(seccion) or {}).items()):
+            salida.append(linea(seccion, nombre, cfg or {}))
 
-    sys.stdout.writelines(d)
+    print("\n".join(salida))
+
+    con_gw = [l for l in salida if " GW=" in l and "GW=-" not in l]
     print()
-    print("%d lineas de diff" % sum(1 for l in d
-                                    if l[0] in "+-" and l[1] not in "+-"))
-    return 1
+    if con_gw:
+        print("--- default gateway en: %s"
+              % ", ".join(l.split()[1] for l in con_gw))
+    else:
+        print("--- NINGUNA interfaz tiene gateway4; todo va por policy routing")
 
 
 if __name__ == "__main__":
