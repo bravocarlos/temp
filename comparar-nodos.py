@@ -60,6 +60,41 @@ class C:
 
 # ------------------------------------------------------------------ lectura
 
+def enriquecer_nics(entradas, ifaces, comparar_ips=False):
+    """Agrega campos de diagnostico que el bucketsconfig no lleva.
+
+    El YAML que genera maas2bucketsconfig solo guarda el NOMBRE de la
+    subred, asi que por si solo no distingue:
+      - dhcp  de  auto  (los dos dicen subnets: [pxe])
+      - link_up  de  realmente sin configurar  (los dos omiten subnets)
+      - una IP estatica de otra
+
+    Estos campos existen solo para comparar; no se escriben en el YAML.
+    """
+    crudas = {i.get("name"): i for i in ifaces}
+
+    for e in entradas:
+        cruda = crudas.get(e["id"])
+        if cruda is None:
+            continue
+
+        links = cruda.get("links") or []
+        if not links:
+            e["_estado"] = "sin-configurar"
+        else:
+            partes = []
+            for lk in links:
+                modo = lk.get("mode", "?")
+                sub = (lk.get("subnet") or {}).get("name")
+                partes.append("%s@%s" % (modo, sub) if sub else modo)
+            e["_estado"] = ",".join(sorted(partes))
+
+        if comparar_ips:
+            ips = [lk["ip_address"] for lk in links if lk.get("ip_address")]
+            if ips:
+                e["_ips"] = sorted(ips)
+
+
 def leer_nodo(args, system_id, jsons, snapshot=None):
     """Devuelve (hostname, {'disks': [...], 'nics': [...]}, avisos)."""
     if snapshot:
@@ -88,10 +123,12 @@ def leer_nodo(args, system_id, jsons, snapshot=None):
 
     avisos = []
     boot = (machine.get("boot_disk") or {}).get("name")
+    nics = gen.construir_nics(ifaces, gen.indice_nics(hw), avisos,
+                              solo_usadas=not args.todas_las_nics)
+    enriquecer_nics(nics, ifaces, comparar_ips=args.comparar_ips)
     datos = {
         "disks": gen.construir_discos(disks, boot, gen.indice_discos(hw), avisos),
-        "nics": gen.construir_nics(ifaces, gen.indice_nics(hw), avisos,
-                                   solo_usadas=not args.todas_las_nics),
+        "nics": nics,
     }
     return hostname, datos, avisos
 
@@ -180,6 +217,9 @@ def main():
     ap.add_argument("--a-json", help="ifaces,disks,machine del nodo A")
     ap.add_argument("--b-json", help="ifaces,disks,machine del nodo B")
     ap.add_argument("--todas-las-nics", action="store_true")
+    ap.add_argument("--comparar-ips", action="store_true",
+                    help="tambien compara las IP asignadas (solo tiene "
+                         "sentido comparando el MISMO nodo antes/despues)")
     ap.add_argument("--sin-color", action="store_true")
     args = ap.parse_args()
 
